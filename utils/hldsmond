@@ -1,0 +1,168 @@
+#!/usr/bin/python
+import sys, os, time, socket, subprocess, signal
+import SimpleMySQL as mysql 
+
+execfile('hldsmond.conf')
+
+HEADER="""HLDS Monitor for CS Portal Project
+Copyright (C) 2009 Luu Phuong "Uzi" Vu, vuluuphuong@gmail.com"""
+
+print os.path.split( os.path.realpath( sys.argv[0] ) )[0]
+
+def Backstick(cmd):
+	return subprocess.Popen(
+		cmd,
+		shell=True,
+		stdout=subprocess.PIPE).communicate()[0].rstrip()
+
+def Daemonize(stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
+	# Perform first fork.
+	try:
+		pid = os.fork( )
+		if pid > 0:
+			sys.exit(0) # Exit first parent.
+	except OSError, e:
+		sys.stderr.write("fork #1 failed: (%d) %s\n" % (e.errno, e.strerror))
+		sys.exit(1)
+	# Decouple from parent environment.
+	os.chdir("/")
+	os.umask(0)
+	os.setsid( )
+	# Perform second fork.
+	try:
+		pid = os.fork( )
+		if pid > 0:
+			sys.exit(0) # Exit second parent.
+	except OSError, e:
+		sys.stderr.write("fork #2 failed: (%d) %s\n" % (e.errno, e.strerror))
+		sys.exit(1)
+	# The process is now daemonized, redirect standard file descriptors.
+	for f in sys.stdout, sys.stderr: f.flush( )
+	si = file(stdin, 'r')
+	so = file(stdout, 'a+')
+	se = file(stderr, 'a+', 0)
+	os.dup2(si.fileno( ), sys.stdin.fileno( ))
+	os.dup2(so.fileno( ), sys.stdout.fileno( ))
+	os.dup2(se.fileno( ), sys.stderr.fileno( ))
+
+def RunDaemon():
+	# Check the current effective user's permission.
+	if os.geteuid():
+		sys.stderr.write("ERROR: You have to be root to run this program\n")
+		sys.exit(1)
+	# Check the targetted HLDS.
+	#if not os.path.isfile(os.path.join(HLDS_ROOT, 'hlds_run')):
+		#sys.stderr.write('ERROR: %s is not a valid HLDS installation.\n' % HLDS_ROOT)
+		#sys.exit(3)
+	# Create the log directories.
+	if not os.path.isdir(LOG_DIR):
+		# Create the common log.
+		os.makedirs(LOG_DIR)
+	# Make this process a daemon.
+	print('Go to the background now. Check %s for logs.\n' % LOG_DIR)
+	Daemonize('/dev/null', 
+		os.path.join(LOG_DIR, LOG_STD), 
+		os.path.join(LOG_DIR, LOG_ERR))
+
+def Log(s):
+	sys.stdout.write('%s: %s\n' % (time.strftime('%Y/%m/%d %H:%M:%S'), s))
+	sys.stdout.flush()
+
+def LogError(s):
+	Log('ERROR: %s' % s)
+	sys.stderr.write('%s: %s\n' % (time.strftime('%Y/%m/%d %H:%M:%S'), s))
+	sys.stderr.flush()
+
+def KillHlds(pid):
+	os.kill(pid, signal.SIGKILL)
+	time.sleep(2)
+	# Double-check.
+	o = Backstick('ps -e|grep "^%d "' % pid)
+	if len(o):
+		LogError("Could not kill %d/hlds_run." % pid)
+		return 0
+	else:
+		Log("Killed %d/hlds_run." % pid)
+		return 1
+
+def RunHlds(r):
+	cmd = 'screen -A -dmS hlds%d ./hlds_run -norestart -pidfile hlds%d.pid -game cstrike ' \
+		  '+ip %s ' \
+		  '-port %d ' \
+		  '+hostname \\"%s\\" ' \
+		  '+maxplayers %d ' \
+		  '+map %s ' \
+		  '+localinfo srv_id %d ' \
+		  % (r['id'], r['id'], r['host'], r['port'], r['name'], r['slots'], r['first_map'], r['id'])
+	if r['cmd_options'] != None:
+		cmd = cmd + ' %s' % r['cmd_options']
+	# Get the server type's specific options.
+	rs = mysql.query("SELECT * FROM cs_server_types WHERE id = %d" % r['type'])
+	if len(rs):
+		r2 = rs[0]
+		if r2['servercfg'] != None:
+			cmd = cmd + ' +servercfgfile %s' % r2['servercfg']
+		if r2['mapcycle'] != None:
+			cmd = cmd + ' +mapcyclefile %s' % r2['mapcycle']
+		if r2['plugins'] != None:
+			cmd = cmd + ' +localinfo amxx_plugins addons/amxmodx/configs/%s' % r2['plugins']
+	# Run the command.
+	Log("Start server ID %d using command: %s" % (r['id'], cmd))
+	mysql.query("CALL cs_srv_start(%d)" % r['id'])
+	os.system('su -c "cd %s; %s" %s' % (r['server_root'], cmd, r['runas'])) 
+	time.sleep(1)
+	pid = Backstick('cat %s/hlds%d.pid' % (r['server_root'], r['id']))
+	if pid:
+		Log("The new HLDS PID is %s" % pid)
+		mysql.query("UPDATE cs_servers SET pid = %s WHERE id = %d" % (pid, r['id']))
+
+def StartMonitor():
+	Log('HLDSMON started, PID = %d' % os.getpid())
+	# Do anything.
+	# Open a connection to the database.
+	while True:
+		# Periodically do something here.
+		if mysql.open(DB_HOST, DB_USER, DB_PWD, DB_DB):
+			# Clean up first.
+			mysql.query("CALL cs_clean_up")
+			# Looking for offline server(s).
+			rs = mysql.query("SELECT * FROM cs_offline_servers WHERE host = '%s'" % HOST_IP)
+			for r in rs:
+				Log("Found offline server ID %d, name \"%s\", port %d" % (r['id'], r['name'], r['port']))
+				# Check if the port is busy.
+				s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+				try:
+					s.bind((HOST_IP, r['port']))
+					s.close()
+					# Start this HLDS.
+					RunHlds(r)
+
+				except socket.error:
+					# The port is busy. Was it occupied by a HLDS?
+					o = Backstick('netstat -nlpu | grep %d | grep hlds_i686' % r['port'])
+					if len(o):
+						# Yes, this port is occupied by a HLDS.
+						# Find out which hlds_run hosts that HLDS.
+						o = Backstick('ps -ef|grep -e "%d .\+hlds_i686"|grep -v " grep "' % int(o.split()[5].split('/')[0]))
+						pid = int(o.split()[2])
+						Log("Port %d is being occupied by a HLDS (%d/hlds_run)." % (r['port'], pid))
+						# Terminate that hlds_run.
+						if KillHlds(pid):
+							# Start the proper HLDS.
+							RunHlds(r)
+					else:
+						# No, this port is not occupied by a HLDS.
+						LogError("Cannot start server ID %d, port %d is being occupied by a non-HLDS process." % (r['id'], r['port']))
+
+			mysql.close()
+		else:
+			LogError(str(mysql.exception))
+		# Sleep and wait for next round.
+		time.sleep(INTERVAL)
+	# End of monitoring process.
+
+if __name__ == "__main__":
+	print(HEADER)
+	# TODO: Check for running HLDSMON.
+	# Start monitoring.
+	StartMonitor()

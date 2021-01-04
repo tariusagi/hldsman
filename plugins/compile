@@ -1,0 +1,140 @@
+#!/bin/ksh
+inc_rev()
+{
+	# Prepare the global version string.
+	if [[ ! -f VERNUM ]]; then
+		echo WARNING: VERNUM does not exist. Generating version number 0.1 ...
+		echo "0.1" > VERNUM
+	fi
+
+	if [[ ! -f BUILDNUM ]]; then
+		echo WARNING: BUILDNUM does not exist. Generating build number 0 ...
+		echo "0" > BUILDNUM
+	fi
+
+	# Increase build number.
+	echo $(( $(cat BUILDNUM) + 1 )) > BUILDNUM
+	echo "// Uzi's plugin version." > version.inc
+	echo "#define PLUGIN_VER \"$(cat VERNUM).$(cat BUILDNUM)\"" >> version.inc
+
+	echo ----------------------------------------
+	echo "Building version $(cat VERNUM).$(cat BUILDNUM)..."
+	echo ----------------------------------------
+}
+
+dec_rev()
+{
+	if [[ ! -f BUILDNUM ]]; then
+		echo WARNING: BUILDNUM does not exist. Will not decrease anything.
+		return
+	fi
+
+	echo $(( $(cat BUILDNUM) - 1 )) > BUILDNUM
+	echo "// Uzi's plugin version." > version.inc
+	echo "#define PLUGIN_VER \""$(cat VERNUM)"."$(cat BUILDNUM)"\"" >> version.inc
+	echo "Reversed revision to "$(cat VERNUM)"."$(cat BUILDNUM)"..."
+}
+
+compile()
+{
+	echo Removing $1.amxx...
+	rm -f plugins/$1.amxx
+	echo Removing make.stderr...
+	rm -f $1.stderr
+	echo Compiling $1.sma...
+	$AC -d2 -e$1.stderr $1.sma
+
+	if [[ ! -f $1.amxx ]]; then
+		echo --------------------------------------------------------------------------------
+		cat $1.stderr
+		echo --------------------------------------------------------------------------------
+		echo ERROR: FAILED TO COMPILE $1.sma! 
+		dec_rev
+		exit 1
+	else
+		if [[ -f $1.stderr ]]; then
+			echo --------------------------------------------------------------------------------
+			cat $1.stderr
+			echo --------------------------------------------------------------------------------
+		fi
+
+		echo Generating source checksum...
+		md5sum $1.sma > chksum/$1.md5
+		echo Moving $1.amxx to plugins/$1.amxx...
+		mv $1.amxx plugins/$1.amxx
+		echo Copying $1.amxx to $AMXX/plugins/$1.amxx...
+		cp plugins/$1.amxx $AMXX/plugins/$1.amxx
+		echo Done!
+	fi
+}
+
+echo 'AMX Mod X plugin compiler utility written by Uzi, vuluuphuong@gmail.com.'
+echo 'Copyright (C) 2008-2100 by Uzi'
+echo
+
+# Prepare build process.
+if [[ $AMXX == "" ]]; then
+	echo ERROR: could not locate the AMX Mod X Compiler.
+	echo Please create an environmental variable named AMXX and set it to the location of the AMX Mod X installation directory before running this script.
+	exit 1
+fi
+
+# AC means Amx mod x Compiler.
+AC="$AMXX/scripting/amxxpc"
+
+if [[ ! -f $AC ]]; then
+	echo ERROR: compiler $AC does not exist!
+	echo Please point the environmental variable AMXX to the correct location.
+	exit 1
+fi
+
+echo Compiler was set to $AC.
+AC="$AMXX/scripting/amxxpc"
+
+LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$AMXX/scripting/"
+export LD_LIBRARY_PATH
+
+# Prepare the list of plugins source to be compiled.
+if [[ $* == "" ]]; then
+	echo WARNING: no input file was given. Terminating...
+	exit 0
+fi
+
+SRC_LIST=`ls $*`
+
+if [[ $? -gt 0 ]]; then
+	echo ERROR: some of the input source does not exist. Aborting...
+	exit 1
+fi
+
+for SRC in $SRC_LIST; do
+	SRC=${SRC%%.sma}
+
+	if [[ -f chksum/$SRC.md5 ]]; then
+		echo Checking $SRC.sma for possible changes in sources...
+		md5sum $SRC.sma > tmp/$SRC.md5
+		cmp chksum/$SRC.md5 tmp/$SRC.md5
+
+		if [[ $? -eq 0 ]]; then
+			# There's no changes in source. This source will not be re-compiled.
+			echo $SRC.sma is unchanged. It is not needed to recompile it.
+			rm -f tmp/$SRC.md5
+			continue
+		else
+			rm -f tmp/$SRC.md5
+			if [[ "$VERSION_GENERATED" == "" ]]; then
+				inc_rev
+				VERSION_GENERATED="yes"
+			fi
+
+			compile $SRC
+		fi
+	else
+		if [[ "$VERSION_GENERATED" == "" ]]; then
+			inc_rev
+			VERSION_GENERATED="yes"
+		fi
+
+		compile $SRC
+	fi
+done
